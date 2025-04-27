@@ -22,10 +22,10 @@ The Map Tile Downloader is a Flask-based web application designed to download ma
 ## Installation
 
 1. Clone the Repository (or download the zip file and extract to the location of your choice):
-   
+
 	git clone https://github.com/mattdrum/map-tile-downloader.git
 	cd map-tile-downloader
-   
+
 2. Install Dependencies (Optional) :
     	The application will automatically install required dependencies from requirements.txt on startup. However, you can manually install them using:
 
@@ -34,19 +34,19 @@ The Map Tile Downloader is a Flask-based web application designed to download ma
 3. Set Up Configuration (Optional, default sources are included) :
 
    Ensure the config/map_sources.json file is present and correctly formatted. See the Configuration section below for an example.
-   
-   
+
+
 ## Configuration
 The application uses a JSON configuration file (config/map_sources.json) to define available map sources. Each entry consists of a name and a URL template for the tiles.
 
 Example map_sources.json:
-	
+
 		"OpenStreetMap": "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
 		"OpenTopoMap": "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
 		"Stamen Terrain": "http://{s}.tile.stamen.com/terrain/{z}/{x}/{y}.png",
 		"CartoDB Positron": "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
 		"CartoDB Dark Matter": "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"
-	
+
 
 Adding a New Map Source: Simply add a new key-value pair to the JSON file with the map name and its tile URL template.
 
@@ -55,7 +55,7 @@ Adding a New Map Source: Simply add a new key-value pair to the JSON file with t
 1.	Navigate to the application directory and Run the Application:
 
 		python src/TileDL.py
-	
+
 	The application will start a local server at http://localhost:5000.
 	- Alternatively you may create a Batch file "StartMap.bat" to launch from windows:
  - 		@echo off
@@ -66,16 +66,16 @@ Adding a New Map Source: Simply add a new key-value pair to the JSON file with t
 3. 	Access the Web Interface:
 
 	Open your web browser and navigate to http://localhost:5000.
-		
+
 4. 	Select Map Style:
 
 	Choose a map style from the dropdown menu. The available options are loaded from map_sources.json.
 5. 	Draw Polygons:
-	
+
 	Use the drawing tools to select areas on the map for which you want to download tiles.
-		
+
 6.	Set Zoom Levels:
-	
+
 	Specify the minimum and maximum zoom levels for the tiles you wish to download.
 
 7.	Download Tiles:
@@ -93,6 +93,60 @@ Adding a New Map Source: Simply add a new key-value pair to the JSON file with t
 
 	Use "Delete Cache" to remove cached tiles for the selected map style.
 
+
+### Command-Line Interface (CLI) Usage
+
+In addition to the web interface, the script can be run directly from the command line to download tiles, supporting multiple styles and zoom ranges simultaneously using parallel processing.
+
+**Basic Syntax:**
+
+```bash
+python src/TileDL.py --bbox <WEST> <SOUTH> <EAST> <NORTH> --downloads <TASK_1> [<TASK_2> ...] [OPTIONS]
+```
+
+**Required Arguments:**
+
+*   `--bbox <WEST> <SOUTH> <EAST> <NORTH>`: Specifies the geographical bounding box for the download. Coordinates are floating-point numbers (longitude, latitude).
+*   `--downloads <TASK_1> [<TASK_2> ...]`: Defines one or more download tasks. Each task specifies a map style and optionally a zoom range.
+    *   **Format:**
+        *   `"Style Name"`: Downloads the style using the default zoom range (requires `--min-zoom` and `--max-zoom` to be set).
+        *   `"Style Name:MinZoom-MaxZoom"`: Downloads the style for the specified zoom range (e.g., `"Standard OSM:10-14"`).
+    *   **Note:** Style names containing spaces must be enclosed in quotes. You can list multiple tasks separated by spaces.
+
+**Optional Arguments:**
+
+*   `--min-zoom <ZOOM>`: Sets the default minimum zoom level if a task in `--downloads` does not specify its own range.
+*   `--max-zoom <ZOOM>`: Sets the default maximum zoom level if a task in `--downloads` does not specify its own range.
+*   `--convert-8bit`: If present, converts downloaded tiles to 8-bit indexed colour PNGs (useful for devices like Meshtastic). Applies to all tasks in the run.
+
+**Behaviour:**
+
+*   **Parallel Downloads:** All specified tile download jobs across all tasks are executed concurrently using multiple threads (currently 10 workers) for faster completion.
+*   **Progress Reporting:** Overall progress percentage and an estimated time remaining (ETA), including days/hours/minutes/seconds, are displayed in the console. The ETA is calculated using a moving average of recent download times.
+*   **Output:** Upon completion, a separate `.zip` file is created in the `downloads/` directory for each task specified in the `--downloads` argument. The zip files are named automatically based on the style and zoom range (e.g., `StyleName_MinZ-MaxZ.zip`).
+
+**Examples:**
+
+1.  **Download a single style for a specific zoom range:**
+    ```bash
+    python src/TileDL.py --bbox -4.9 52.6 -2.1 53.7 --downloads "CartoDB Dark Matter:10-15"
+    ```
+
+2.  **Download multiple styles, each with specific zoom ranges:**
+    ```bash
+    python src/TileDL.py --bbox -4.9 52.6 -2.1 53.7 --downloads "Standard OSM:10-12" "Esri World Imagery Satellite:13-16"
+    ```
+
+3.  **Download multiple styles, one with a specific range, one using default range:**
+    ```bash
+    python src/TileDL.py --bbox -4.9 52.6 -2.1 53.7 --min-zoom 8 --max-zoom 11 --downloads "Standard OSM:12-14" "OpenTopoMap Outdoors"
+    ```
+    *(This downloads "Standard OSM" for 12-14 and "OpenTopoMap Outdoors" for 8-11)*
+
+4.  **Download with 8-bit conversion:**
+    ```bash
+    python src/TileDL.py --bbox -4.9 52.6 -2.1 53.7 --downloads "Standard OSM:10-13" --convert-8bit
+    ```
 
 ## Contributing
 

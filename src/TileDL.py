@@ -1,6 +1,9 @@
 import subprocess
 import sys
 import os
+import argparse
+import math  # For tile calculations
+import collections  # For moving average deque
 from flask import Flask, render_template, request, send_file, jsonify
 from flask_socketio import SocketIO, emit
 import mercantile
@@ -28,7 +31,7 @@ DOWNLOADS_DIR.mkdir(exist_ok=True)
 
 ## Note: Moved to 'utils/dependency_installer.py'
 # Ensure dependencies are installed
-#def install_dependencies():
+# def install_dependencies():
 #    try:
 #        with open('requirements.txt', 'r') as f:
 #            requirements = f.read().splitlines()
@@ -38,7 +41,7 @@ DOWNLOADS_DIR.mkdir(exist_ok=True)
 #        sys.exit(1)
 #
 ## Install dependencies on startup if not already installed
-#install_dependencies()
+# install_dependencies()
 
 app = Flask(__name__, template_folder='../templates')
 socketio = SocketIO(app)
@@ -147,14 +150,14 @@ def download_tiles_with_retries(tiles, map_style, style_cache_dir, convert_to_8b
     retry_queue = []
     max_workers = 5
     batch_size = 10
-    
+
     def process_batch(batch):
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(download_tile, tile, map_style, style_cache_dir, convert_to_8bit): tile for tile in batch}
             for future in as_completed(futures):
                 if future.result() is None and download_event.is_set():
                     retry_queue.append(futures[future])
-    
+
     while tiles and download_event.is_set():
         for i in range(0, len(tiles), batch_size):
             if not download_event.is_set():
@@ -166,7 +169,7 @@ def download_tiles_with_retries(tiles, map_style, style_cache_dir, convert_to_8b
         if tiles:
             delay = min(2 ** len(retry_queue), 8)
             time.sleep(delay)
-    
+
     if download_event.is_set():
         socketio.emit('tiles_downloaded')
 
@@ -296,7 +299,396 @@ def get_cached_tiles_route(style_name):
                 pass
     return jsonify(cached_tiles)
 
+
+# --- Add new function: get_tiles_for_bbox ---
+def deg2num(lat_deg, lon_deg, zoom):
+    lat_rad = math.radians(lat_deg)
+    n = 2.0**zoom
+    xtile = int((lon_deg + 180.0) / 360.0 * n)
+    ytile = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
+    return xtile, ytile
+
+
+def get_tiles_for_zoom(west, south, east, north, zoom):
+    """Generate list of tiles within the bounding box for a single specified zoom level."""
+    all_tiles = []
+    min_x, min_y = deg2num(north, west, zoom)
+    max_x, max_y = deg2num(south, east, zoom)
+    for x in range(min_x, max_x + 1):
+        for y in range(min_y, max_y + 1):
+            all_tiles.append(mercantile.Tile(x, y, zoom))
+    all_tiles.sort(key=lambda tile: (-tile.x, tile.y))
+    return all_tiles
+
+
+# --- Add new function: download_tile_cli ---
+def download_tile_cli(tile, map_style, style_cache_dir, convert_to_8bit, max_retries=3):
+    """Download a single tile for CLI, with retries, converting to 8-bit if specified. Returns (tile_path, status, duration)."""
+    tile_dir = style_cache_dir / str(tile.z) / str(tile.x)
+    tile_path = tile_dir / f"{tile.y}.png"
+    start_dl_time = time.time()
+
+    if tile_path.exists():
+        return tile_path, "skipped", 0
+
+    subdomain = random.choice(["a", "b", "c"]) if "{s}" in map_style else ""
+    url = (
+        map_style.replace("{s}", subdomain)
+        .replace("{z}", str(tile.z))
+        .replace("{x}", str(tile.x))
+        .replace("{y}", str(tile.y))
+    )
+    headers = {"User-Agent": "MapTileDownloaderCLI/1.0"}
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            duration = (
+                time.time() - start_dl_time
+            )
+            if response.status_code == 200:
+                tile_dir.mkdir(parents=True, exist_ok=True)
+                with open(tile_path, "wb") as f:
+                    f.write(response.content)
+
+                if convert_to_8bit:
+                    try:
+                        with Image.open(tile_path) as img:
+                            if img.mode != "P":
+                                img = img.quantize(colors=256)
+                                img.save(tile_path)
+                    except Exception as e:
+                        print(
+                            f"\nWarning: Failed to convert tile {tile.z}/{tile.x}/{tile.y} to 8-bit: {e}"
+                        )
+
+                return (
+                    tile_path,
+                    "downloaded",
+                    duration,
+                )
+
+            elif response.status_code == 404:
+                print(
+                    f"\nWarning: Tile {tile.z}/{tile.x}/{tile.y} not found (404). Skipping."
+                )
+                return None, "skipped", duration
+
+            else:
+                print(
+                    f"\nWarning: Tile {tile.z}/{tile.x}/{tile.y} failed with status {response.status_code}. Retrying ({attempt + 1}/{max_retries})..."
+                )
+                time.sleep(2**attempt)
+
+        except requests.RequestException as e:
+            duration = time.time() - start_dl_time  # Calculate duration on exception
+            print(
+                f"\nWarning: Tile {tile.z}/{tile.x}/{tile.y} request failed: {e}. Retrying ({attempt + 1}/{max_retries})..."
+            )
+            time.sleep(2**attempt)
+
+    duration = (
+        time.time() - start_dl_time
+    )  # Calculate duration after all retries failed
+    print(
+        f"\nError: Failed to download tile {tile.z}/{tile.x}/{tile.y} after {max_retries} attempts."
+    )
+    return None, "failed", duration
+
+
+
+def run_cli_download(args):
+    """Orchestrates the tile download process based on CLI arguments, processing multiple styles/zooms in parallel."""
+    print("Running in Command-Line Interface mode (Parallel).")
+
+    download_tasks = []
+    if not args.downloads:
+        print("Error: At least one download task must be specified using --downloads.")
+        sys.exit(1)
+
+    for task_str in args.downloads:
+        style_name = ""
+        min_zoom_task = args.min_zoom
+        max_zoom_task = args.max_zoom
+
+        if ":" in task_str:
+            parts = task_str.split(":", 1)
+            style_name = parts[0]
+            zoom_parts = parts[1].split("-")
+            if len(zoom_parts) == 2:
+                try:
+                    min_zoom_task = int(zoom_parts[0])
+                    max_zoom_task = int(zoom_parts[1])
+                except ValueError:
+                    print(
+                        f"Error: Invalid zoom range format in '{task_str}'. Expected 'Min-Max'."
+                    )
+                    sys.exit(1)
+            else:
+                print(
+                    f"Error: Invalid zoom range format in '{task_str}'. Expected 'Min-Max'."
+                )
+                sys.exit(1)
+        else:
+            style_name = task_str
+            if min_zoom_task is None or max_zoom_task is None:
+                print(
+                    f"Error: Zoom range not specified for style '{style_name}' and no default --min-zoom/--max-zoom provided."
+                )
+                sys.exit(1)
+
+        if style_name not in MAP_SOURCES:
+            print(
+                f"Error: Map style '{style_name}' not found in config/map_sources.json."
+            )
+            print(f"Available styles: {', '.join(MAP_SOURCES.keys())}")
+            sys.exit(1)
+
+        if min_zoom_task < 0 or max_zoom_task > 19 or min_zoom_task > max_zoom_task:
+            print(
+                f"Error: Invalid zoom range ({min_zoom_task}-{max_zoom_task}) for style '{style_name}'. Must be 0-19, min <= max."
+            )
+            sys.exit(1)
+
+        task_details = {
+            "style_name": style_name,
+            "min_zoom": min_zoom_task,
+            "max_zoom": max_zoom_task,
+            "map_style_url": MAP_SOURCES[style_name],
+            "style_cache_dir": get_style_cache_dir(style_name),
+            "tiles_for_task": {},
+        }
+        task_details["style_cache_dir"].mkdir(exist_ok=True)
+        download_tasks.append(task_details)
+
+    if not args.bbox or len(args.bbox) != 4:
+        print(
+            "Error: Bounding box (--bbox WEST SOUTH EAST NORTH) is required and must contain 4 values."
+        )
+        sys.exit(1)
+    west, south, east, north = args.bbox
+
+    print("Calculating tiles and preparing download jobs...")
+    all_tile_jobs = []
+    total_tiles_across_all_tasks = 0
+    for task in download_tasks:
+        task_tile_count = 0
+        print(
+            f"  Task: Style='{task['style_name']}', Zoom={task['min_zoom']}-{task['max_zoom']}"
+        )
+        for z in range(task["min_zoom"], task["max_zoom"] + 1):
+            tiles_for_this_zoom = get_tiles_for_zoom(west, south, east, north, z)
+            count = len(tiles_for_this_zoom)
+            if count > 0:
+                task_tile_count += count
+                print(f"    Zoom {z}: {count} tiles")
+                for tile in tiles_for_this_zoom:
+                    all_tile_jobs.append(
+                        {
+                            "tile": tile,
+                            "map_style_url": task["map_style_url"],
+                            "style_cache_dir": task["style_cache_dir"],
+                            "convert_8bit": args.convert_8bit,
+                        }
+                    )
+            else:
+                print(f"    Zoom {z}: 0 tiles")
+        print(f"  Subtotal for task: {task_tile_count} tiles")
+        total_tiles_across_all_tasks += task_tile_count
+
+    if total_tiles_across_all_tasks == 0:
+        print("\nNo tiles found for any specified task.")
+        sys.exit(0)
+
+    print(f"\nGrand total tiles to process: {total_tiles_across_all_tasks}")
+    print("-" * 40)
+
+    overall_processed = 0
+    overall_downloaded = 0
+    overall_skipped = 0
+    overall_failed = 0
+    overall_start_time = time.time()
+    overall_recent_download_times = collections.deque(maxlen=100)
+    max_workers = 10
+
+    print(f"Starting parallel download with {max_workers} workers...")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                download_tile_cli,
+                job["tile"],
+                job["map_style_url"],
+                job["style_cache_dir"],
+                job["convert_8bit"],
+            ): job
+            for job in all_tile_jobs
+        }
+
+        for future in as_completed(futures):
+            job_details = futures[future]
+            try:
+                tile_path, status, duration = future.result()
+                overall_processed += 1
+
+                if status == "downloaded":
+                    overall_downloaded += 1
+                    overall_recent_download_times.append(duration)
+                elif status == "skipped":
+                    overall_skipped += 1
+                elif status == "failed":
+                    overall_failed += 1
+
+                elapsed_time = time.time() - overall_start_time
+                progress_percent = (
+                    (overall_processed / total_tiles_across_all_tasks) * 100
+                    if total_tiles_across_all_tasks > 0
+                    else 0
+                )
+                eta_str = "Calculating..."
+
+                if len(overall_recent_download_times) > 0:
+                    if (
+                        len(overall_recent_download_times)
+                        >= overall_recent_download_times.maxlen / 2
+                    ):
+                        avg_time_per_tile = sum(overall_recent_download_times) / len(
+                            overall_recent_download_times
+                        )
+                    elif overall_processed > 0 and elapsed_time > 0:
+                        effective_processed_for_time = (
+                            overall_downloaded + overall_failed
+                        )
+                        if effective_processed_for_time > 0:
+                            avg_time_per_tile = (
+                                elapsed_time / effective_processed_for_time
+                            )
+                        else:
+                            avg_time_per_tile = 0
+                    else:
+                        avg_time_per_tile = 0
+
+                    if avg_time_per_tile > 0:
+                        remaining_tiles = (
+                            total_tiles_across_all_tasks - overall_processed
+                        )
+                        remaining_time = avg_time_per_tile * remaining_tiles
+                        eta_total_seconds = int(remaining_time)
+                        eta_days = eta_total_seconds // (24 * 3600)
+                        eta_hours = (eta_total_seconds % (24 * 3600)) // 3600
+                        eta_minutes = (eta_total_seconds % 3600) // 60
+                        eta_seconds = eta_total_seconds % 60
+                        if eta_days > 0:
+                            eta_str = f"{eta_days}d {eta_hours}h {eta_minutes}m {eta_seconds}s"
+                        elif eta_hours > 0:
+                            eta_str = f"{eta_hours}h {eta_minutes}m {eta_seconds}s"
+                        else:
+                            eta_str = f"{eta_minutes}m {eta_seconds}s"
+                    else:
+                        eta_str = "0m 0s"
+
+                print(
+                    f"\rOverall Progress: {progress_percent:.1f}% [{overall_processed}/{total_tiles_across_all_tasks}] | ETA: {eta_str}   ",
+                    end="",
+                )
+
+            except Exception as exc:
+                failed_tile = job_details["tile"]
+                print(
+                    f"\nError processing tile {failed_tile.z}/{failed_tile.x}/{failed_tile.y}: {exc}"
+                )
+                overall_processed += 1
+                overall_failed += 1
+
+    print()
+    print("\n--- Overall Download Summary ---")
+    print(f"Total tiles processed: {overall_processed}")
+    print(f"Successfully downloaded: {overall_downloaded}")
+    print(f"Skipped (already cached or 404): {overall_skipped}")
+    print(f"Failed: {overall_failed}")
+    print("-" * 40)
+
+    if overall_failed > 0:
+        print("Download process completed with errors.")
+
+    print("\n--- Creating Zip Files ---")
+    zip_success_count = 0
+    for task in download_tasks:
+        style_name_zip = task["style_name"]
+        style_cache_dir_zip = task["style_cache_dir"]
+        min_zoom_zip = task["min_zoom"]
+        max_zoom_zip = task["max_zoom"]
+        output_filename = (
+            f"{sanitize_style_name(style_name_zip)}_{min_zoom_zip}-{max_zoom_zip}.zip"
+        )
+        output_path = DOWNLOADS_DIR / output_filename
+
+        print(
+            f"Creating zip for '{style_name_zip}' ({min_zoom_zip}-{max_zoom_zip}): {output_path} ..."
+        )
+        try:
+            if any(style_cache_dir_zip.iterdir()):
+                zip_path_str = create_zip(style_cache_dir_zip, style_name_zip)
+                final_zip_path = Path(zip_path_str)
+                if output_path.exists():
+                    output_path.unlink()
+                final_zip_path.rename(output_path)
+                print(f"  Zip file created successfully: {output_path}")
+                zip_success_count += 1
+            else:
+                print(
+                    f"  Skipping zip for '{style_name_zip}': No tiles found in cache directory."
+                )
+        except Exception as e:
+            print(f"  Error creating zip file for '{style_name_zip}': {e}")
+
+    print(
+        f"--- Zip creation finished ({zip_success_count}/{len(download_tasks)} successful) ---"
+    )
+    print("\nCLI download process finished.")
+
+
 if __name__ == '__main__':
-    CACHE_DIR.mkdir(exist_ok=True)
-    CONFIG_DIR.mkdir(exist_ok=True)
-    socketio.run(app, debug=True)
+    parser = argparse.ArgumentParser(description="Map Tile Downloader - Web UI or CLI")
+    parser.add_argument("--cli", action="store_true", help="Force run in CLI mode.")
+    parser.add_argument(
+        "--bbox",
+        type=float,
+        nargs=4,
+        metavar=("WEST", "SOUTH", "EAST", "NORTH"),
+        help="Bounding box for tile download (required in CLI mode).",
+    )
+    parser.add_argument(
+        "--min-zoom",
+        type=int,
+        help="Default minimum zoom level if not specified per style.",
+    )
+    parser.add_argument(
+        "--max-zoom",
+        type=int,
+        help="Default maximum zoom level if not specified per style.",
+    )
+    parser.add_argument(
+        "--downloads",
+        required=True,
+        nargs="+",
+        metavar="STYLE[:MIN-MAX]",
+        help='Download task(s). Format: "StyleName" or "StyleName:MinZoom-MaxZoom".',
+    )
+    parser.add_argument(
+        "--convert-8bit",
+        action="store_true",
+        help="Convert downloaded tiles to 8-bit palette PNG.",
+    )
+
+    args = parser.parse_args()
+
+    is_cli_mode = bool(args.downloads)
+
+    if is_cli_mode:
+        run_cli_download(args)
+    else:
+        print("Starting Flask web server. Use --bbox and --downloads for CLI mode.")
+        CACHE_DIR.mkdir(exist_ok=True)
+        CONFIG_DIR.mkdir(exist_ok=True)
+        DOWNLOADS_DIR.mkdir(exist_ok=True)
+        socketio.run(app, debug=True, use_reloader=False)
